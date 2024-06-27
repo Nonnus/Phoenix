@@ -20,8 +20,10 @@ public struct ProjectGenerator: ProjectGeneratorProtocol {
     public func generate(document: PhoenixDocument, folderURL: URL) throws {
         let packagesWithPath: [PackageWithPath] = documentPackagesProvider.packages(for: document)
         for packageWithPath in packagesWithPath {
+            let name = packageWithPath.package.name
             let url = folderURL.appendingPathComponent(packageWithPath.path, isDirectory: true)
-            try packageGenerator.generate(package: packageWithPath.package, at: url)
+            let meta = document.metaComponents.first { $0.name == name }
+            try packageGenerator.generate(package: packageWithPath.package, at: url, packages: packagesWithPath, meta: meta)
         }
     }
 }

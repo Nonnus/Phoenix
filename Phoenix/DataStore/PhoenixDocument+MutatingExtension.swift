@@ -16,7 +16,12 @@ extension PhoenixDocument {
         else { return }
         completion(&families[familyIndex].components[componentIndex])
     }
-    
+
+    private mutating func getMeta(withName name: String, _ completion: (inout MetaComponent) -> Void) {
+        guard let metaIndex = metaComponents.firstIndex(where: { $0.name == name }) else { return }
+        completion(&metaComponents[metaIndex])
+    }
+
     // MARK: - Document modifiers
     mutating func addNewComponent(withName name: Name) throws {
         if name.given.isEmpty {
@@ -86,6 +91,16 @@ extension PhoenixDocument {
         macroComponents.sort(by: { $0.name < $1.name })
     }
     
+    mutating func addNewMetaComponent(with name: String) throws {
+        if name.isEmpty {
+            throw NSError(domain: "Meta name cannot be empty", code: 500)
+        } else if metaComponents.contains(where: { $0.name == name }) {
+            throw NSError(domain: "Meta name already in use", code: 502)
+        }
+        metaComponents.append(MetaComponent(name: name))
+        metaComponents.sort(by: { $0.name < $1.name })
+    }
+    
     mutating func addDependencyToComponent(withName name: Name, dependencyName: Name) {
         var defaultDependencies: [PackageTargetType: String] = component(named: dependencyName)?.defaultDependencies ?? [:]
         if defaultDependencies.isEmpty {
@@ -113,7 +128,34 @@ extension PhoenixDocument {
             component.localDependencies = localDependencies
         }
     }
-    
+
+    mutating func addDependencyToMeta(withName name: String, dependencyName: Name) {
+        var defaultDependencies: [PackageTargetType: String] = component(named: dependencyName)?.defaultDependencies ?? [:]
+        if defaultDependencies.isEmpty {
+            defaultDependencies = family(named: dependencyName.family)?.defaultDependencies ?? [:]
+        }
+        if defaultDependencies.isEmpty {
+            defaultDependencies = projectConfiguration.defaultDependencies
+        }
+
+        var targetTypes: [PackageTargetType: String] = [:]
+        getComponent(withName: dependencyName) { dependencyComponent in
+            if !defaultDependencies.values.contains(where: { dependencyComponent.modules[$0] == nil }) {
+                targetTypes = defaultDependencies.filter{ element in
+                    dependencyComponent.modules.contains { (key, _) in
+                        key == element.value
+                    }
+                }
+            }
+        }
+        getMeta(withName: name) { meta in
+            var localDependencies = meta.localDependencies
+            localDependencies.append(ComponentDependency(name: dependencyName, targetTypes: targetTypes))
+            localDependencies.sort()
+            meta.localDependencies = localDependencies
+        }
+    }
+
     mutating func addRemoteDependencyToComponent(withName name: Name, dependencyURL: String) {
         getComponent(withName: name) { component in
             component.remoteComponentDependencies.append(
@@ -155,5 +197,9 @@ extension PhoenixDocument {
     
     mutating func removeMacroComponent(withName name: String) {
         macroComponents.removeAll(where: { $0.name == name })
+    }
+
+    mutating func removeMetaComponent(withName name: String) {
+        metaComponents.removeAll(where: { $0.name == name })
     }
 }

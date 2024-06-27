@@ -2,6 +2,8 @@ import PackageGeneratorContract
 import PackageStringProviderContract
 import Foundation
 import SwiftPackage
+import PhoenixDocument
+import ProjectGeneratorContract
 
 extension SwiftPackage {
     var isMacroPackage: Bool {
@@ -12,27 +14,23 @@ extension SwiftPackage {
 public struct PackageGenerator: PackageGeneratorProtocol {
     let fileManager: FileManager
     let packageStringProvider: PackageStringProviderProtocol
-
+    
     public init(fileManager: FileManager,
                 packageStringProvider: PackageStringProviderProtocol) {
         self.fileManager = fileManager
         self.packageStringProvider = packageStringProvider
     }
     
-    public func generate(package: SwiftPackage, at url: URL) throws {
+    public func generate(package: SwiftPackage, at url: URL, packages: [PackageWithPath], meta: MetaComponent?) throws {
         try createPackageFolderIfNecessary(at: url)
-
+        
         try package.targets.forEach { target in
             switch target.type {
             case .executableTarget:
                 try createExecutableSourcesFolderIfNecessary(at: url, name: target.name, importName: package.name)
                 try createResourceFoldersIfNecessary(inFolder: "Sources", at: url, for: target)
             case .target:
-                if package.isMacroPackage {
-                    try createMacroPackageSourcesFolderIfNecessary(at: url, name: target.name)
-                } else {
-                    try createSourcesFolderIfNecessary(at: url, name: target.name)
-                }
+                try createSourcesFolderIfNecessary(at: url, name: target.name)
                 try createResourceFoldersIfNecessary(inFolder: "Sources", at: url, for: target)
             case .testTarget:
                 try createTestsFolderIfNecessary(at: url, name: target.name, isMacroPackage: package.isMacroPackage)
@@ -40,12 +38,16 @@ public struct PackageGenerator: PackageGeneratorProtocol {
             case .macro:
                 try createMacroSourcesFolderIfNecessary(at: url, name: target.name)
                 try createResourceFoldersIfNecessary(inFolder: "Sources", at: url, for: target)
+            case .meta:
+                try recreateMetaSourcesFolder(at: url, name: target.name)
+                try symlinkMetaPackageSources(inFolder: "Sources", from: url, for: target, packages: packages, meta: meta)
             }
         }
+        //here we make sure all the child dependencies are added?
         try createPackageFile(for: package, at: url)
         try createReadMeFileIfNecessary(at: url, withName: package.name)
     }
-
+    
     private func createResourceFoldersIfNecessary(inFolder folder: String, at url: URL, for target: Target) throws {
         for resource in target.resources {
             // Resources folder needs to be created inside the right folder for the given Target
@@ -55,7 +57,7 @@ public struct PackageGenerator: PackageGeneratorProtocol {
             _ = try createFolderIfNecessary(folder: resource.folderName, at: newURL, withName: "")
         }
     }
-
+    
     private func createPackageFolderIfNecessary(at url: URL) throws {
         let path = url.path
         if !fileManager.fileExists(atPath: path) {
@@ -72,27 +74,56 @@ public struct PackageGenerator: PackageGeneratorProtocol {
         let path = try createFolderIfNecessary(folder: "Sources", at: url, withName: name)
         try createMacroSourceFile(name: name, atPath: path)
     }
-
+    
     private func createSourcesFolderIfNecessary(at url: URL, name: String) throws {
         let path = try createFolderIfNecessary(folder: "Sources", at: url, withName: name)
         try createSourceFile(name: name, atPath: path)
     }
-
-    private func createMacroPackageSourcesFolderIfNecessary(at url: URL, name: String) throws {
-        let path = try createFolderIfNecessary(folder: "Sources", at: url, withName: name)
-        try createMacroPackageSourceFile(name: name, atPath: path)
+    
+    private func recreateMetaSourcesFolder(at url: URL, name: String) throws {
+        _ = try recreateFolder(folder: "Sources", at: url, withName: name)
     }
-
+    
+    private func symlinkMetaPackageSources(inFolder: String, from url: URL, for target: Target, packages: [PackageWithPath], meta: MetaComponent?) throws {
+        let atPath = url
+            .appendingPathComponent(inFolder)
+            .appendingPathComponent(target.name)
+        let shell = Shell(verbose: true)
+        
+        guard let localDependencies = meta?.localDependencies else { return }
+        var filteredDependencyPaths: [String] = []
+        for dependency in localDependencies {
+            dependency.targetTypes.forEach { targetType in
+                if targetType.value == "Contract" {
+                    let dependencyName = "\(dependency.name.full)\(targetType.key.name)"
+                    if let dependencyPackage = packages.first(where: { $0.package.name == dependencyName }) {
+                        filteredDependencyPaths.append(dependencyPackage.path)
+                        let dependencyPackagePath = dependencyPackage.path
+                        let dependencyPackageURL = url
+                            .deletingLastPathComponent()
+                            .deletingLastPathComponent()
+                            .appendingPathComponent(dependencyPackagePath)
+                            .appendingPathComponent(inFolder)
+                            .appendingPathComponent(dependencyName)
+                            .absoluteURL
+                        let dependencyPath = dependencyPackageURL.relativePath(from: atPath)!
+                        _ = try? shell.execute("ln -s \(dependencyPath) \(atPath.absoluteString)")
+                    }
+                }
+            }
+        }
+    }
+    
     private func createTestsFolderIfNecessary(at url: URL, name: String, isMacroPackage: Bool) throws {
         let path = try createFolderIfNecessary(folder: "Tests", at: url, withName: name)
-
+        
         if isMacroPackage {
             try createMacroTestFile(name: name, atPath: path)
         } else {
             try createTestFile(name: name, atPath: path)
         }
     }
-
+    
     private func createFolderIfNecessary(folder: String, at url: URL, withName name: String) throws -> String {
         let path = url.appendingPathComponent(folder).appendingPathComponent(name, isDirectory: true).path
         if !fileManager.fileExists(atPath: path) {
@@ -100,7 +131,21 @@ public struct PackageGenerator: PackageGeneratorProtocol {
         }
         return path
     }
-
+    
+    private func recreateFolder(folder: String, at url: URL, withName name: String) throws -> String {
+        var path = url.path
+        // Delete package folder
+        if fileManager.fileExists(atPath: path) {
+            try fileManager.removeItem(atPath: path)
+        }
+        // Create package folder
+        try fileManager.createDirectory(atPath: path, withIntermediateDirectories: true)
+        // Create sources folder
+        path = url.appendingPathComponent(folder).appendingPathComponent(name, isDirectory: true).path
+        try fileManager.createDirectory(atPath: path, withIntermediateDirectories: true)
+        return path
+    }
+    
     private func isDirectoryEmpty(atPath path: String) -> Bool {
         do {
             let contents = try fileManager.contentsOfDirectory(atPath: path)
@@ -112,7 +157,7 @@ public struct PackageGenerator: PackageGeneratorProtocol {
     
     private func createExecutableSourceFile(name: String, atPath path: String, importName: String) throws {
         guard isDirectoryEmpty(atPath: path) else { return }
-
+        
         let content: String = """
 import \(importName)
 
@@ -123,7 +168,7 @@ let (result, code) = #stringify(a + b)
 
 print("The value \\(result) was produced by the code \\(code)\")
 """
-
+        
         fileManager.createFile(atPath: path.appending("/\(name).swift"),
                                contents: content.data(using: .utf8))
     }
@@ -146,25 +191,25 @@ public macro stringify<T>(_ value: T) -> (T, String) = #externalMacro(module: "\
         fileManager.createFile(atPath: path.appending("/\(name).swift"),
                                contents: content.data(using: .utf8))
     }
-
+    
     private func createSourceFile(name: String, atPath path: String) throws {
         guard isDirectoryEmpty(atPath: path) else { return }
-
+        
         let content: String = """
 struct \(name) {
     var text: String = "Hello, World!"
 }
 
 """
-
+        
         fileManager.createFile(atPath: path.appending("/\(name).swift"),
                                contents: content.data(using: .utf8),
                                attributes: nil)
     }
-
+    
     private func createMacroSourceFile(name: String, atPath path: String) throws {
         guard isDirectoryEmpty(atPath: path) else { return }
-
+        
         let content: String = """
 import SwiftCompilerPlugin
 import SwiftSyntax
@@ -200,16 +245,16 @@ struct \(name)Plugin: CompilerPlugin {
     ]
 }
 """
-
+        
         fileManager.createFile(atPath: path.appending("/\(name).swift"),
                                contents: content.data(using: .utf8),
                                attributes: nil)
     }
-
+    
     
     private func createTestFile(name: String, atPath path: String) throws {
         guard isDirectoryEmpty(atPath: path) else { return }
-
+        
         var className = name
         if className.hasSuffix("Tests") {
             className = String(className.dropLast(5))
@@ -229,10 +274,10 @@ final class \(name): XCTestCase {
                                contents: content.data(using: .utf8),
                                attributes: nil)
     }
-
+    
     private func createMacroTestFile(name: String, atPath path: String) throws {
         guard isDirectoryEmpty(atPath: path) else { return }
-
+        
         var className = name
         if className.hasSuffix("Tests") {
             className = String(className.dropLast(5))
@@ -290,21 +335,21 @@ final class \(className)Tests: XCTestCase {
                                contents: content.data(using: .utf8),
                                attributes: nil)
     }
-
+    
     func createPackageFile(for package: SwiftPackage, at url: URL) throws {
         let content = packageStringProvider.string(for: package)
-
+        
         let path = url.path.appending("/Package.swift")
         try? fileManager.removeItem(atPath: path)
         fileManager.createFile(atPath: path,
                                contents: content.data(using: .utf8),
                                attributes: nil)
     }
-
+    
     func createReadMeFileIfNecessary(at url: URL, withName name: String) throws {
         let path = url.path.appending("/README.md")
         guard !fileManager.fileExists(atPath: path) else { return }
-
+        
         let content: String = """
 # \(name)
 
@@ -315,4 +360,3 @@ A description of this package.
                                attributes: nil)
     }
 }
-

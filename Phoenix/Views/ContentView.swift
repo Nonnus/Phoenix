@@ -9,7 +9,7 @@ import SwiftPackage
 import ValidationFeature
 
 enum ListSelection: String, Hashable, CaseIterable, Identifiable {
-    static var allCases: [ListSelection] { [.components, .remote, .macros] }
+    static var allCases: [ListSelection] { [.components, .remote, .macros, .meta] }
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
     var keyboardShortcut: KeyEquivalent {
@@ -22,6 +22,8 @@ enum ListSelection: String, Hashable, CaseIterable, Identifiable {
             return "3"
         case .plugins:
             return "4"
+        case .meta:
+            return "5"
         }
     }
     
@@ -29,6 +31,7 @@ enum ListSelection: String, Hashable, CaseIterable, Identifiable {
     case remote
     case macros
     case plugins
+    case meta
 }
 
 enum InspectorSelection: String, Hashable, CaseIterable, Identifiable {
@@ -152,11 +155,13 @@ struct ContentView: View {
                     macrosList()
                 case .plugins:
                     pluginsList()
+                case .meta:
+                    metasList()
                 }
                 FilterView(text: $viewModel.componentsListFilter.nonOptionalBinding)
             }
         }
-        .frame(minWidth: 250)
+        .frame(minWidth: 280)
     }
     
     @ViewBuilder private func componentsList() -> some View {
@@ -223,6 +228,23 @@ struct ContentView: View {
         }
     }
     
+    @ViewBuilder private func metasList() -> some View {
+        VStack(alignment: .leading) {
+            Button(action: viewModel.onAddMetaButton) {
+                Label("New Meta", systemImage: "plus.circle.fill")
+            }
+            .keyboardShortcut("M", modifiers: [.command, .shift])
+            .with(accessibilityIdentifier: ToolbarIdentifiers.newComponentButton)
+            .padding(.horizontal)
+            MetasList(
+                selected: viewModel.selection?.metaId,
+                rows: viewModel.metasList(document: document),
+                onSelect: viewModel.select(meta:)
+            )
+            Spacer()
+        }
+    }
+    
     @ViewBuilder private func contentView() -> some View {
         HSplitView {
             Group {
@@ -241,6 +263,11 @@ struct ContentView: View {
                     remoteComponentView(for: selectedRemoteComponentBinding)
                 } else if let selectedMacroBinding = viewModel.selectedMacro(document: $document) {
                     macroComponentView(for: selectedMacroBinding)
+                } else if let selectedMetaBinding = viewModel.selectedMeta(document: $document) {
+                    metaComponentView(for: selectedMetaBinding)
+                        .sheet(isPresented: .constant(viewModel.showingDependencySheet)) {
+                            dependencySheet(meta: selectedMetaBinding.wrappedValue)
+                        }
                 } else {
                     HStack(alignment: .top) {
                         VStack(alignment: .leading) {
@@ -259,7 +286,7 @@ struct ContentView: View {
         }
     }
     
-    @ViewBuilder private func componentView(for component: Binding<Component>) -> some View {
+    private func componentView(for component: Binding<Component>) -> some View {
         ComponentView(
             component: component,
             remoteDependencies: document.remoteComponents.reduce(into: [String: RemoteComponent](), { partialResult, remoteComponent in
@@ -308,7 +335,23 @@ struct ContentView: View {
             onRemove: { document.removeMacroComponent(withName: macroComponent.wrappedValue.name) }
         )
     }
-    
+
+    @ViewBuilder private func metaComponentView(for metaComponent: Binding<MetaComponent>) -> some View {
+        MetaComponentView(
+            component: metaComponent,
+            relationViewData: document.metaComponentRelationViewData(metaComponentName: metaComponent.wrappedValue.name),
+            relationViewDataToComponentNamed: { dependencyName, selectedValues in
+                document.relationViewData(fromMetaName: metaComponent.wrappedValue.name,
+                                          toComponentName: dependencyName,
+                                          selectedValues: selectedValues)
+            },
+            titleForComponentNamed: document.title(forComponentNamed:),
+            onRemove: { document.removeMetaComponent(withName: metaComponent.wrappedValue.name) },
+            onShowDependencySheet: { viewModel.showingDependencySheet = true },
+            onSelectComponentName: viewModel.select(componentName:)
+        )
+    }
+
     @ViewBuilder private func detailView() -> some View {
         if inspectorSelection == .none || viewModel.selection == nil {
             EmptyView()
@@ -326,6 +369,8 @@ struct ContentView: View {
         switch viewModel.selection {
         case let .component(name):
             return document.title(forComponentNamed: name)
+        case let .meta(name: name):
+            return name
         case let .remoteComponent(url):
             return url
         case let .macro(name):
@@ -339,6 +384,8 @@ struct ContentView: View {
         switch viewModel.selection {
         case let .component(name):
             return document.mentions(forName: name)
+        case let .meta(name):
+            return document.mentions(forMeta: name)
         case let .remoteComponent(url):
             return document.mentions(forURL: url)
         case let .macro(name):
@@ -380,7 +427,16 @@ struct ContentView: View {
             } onDismiss: {
                 viewModel.showingNewComponentPopup = nil
             }
+            
+        case .meta:
+            NewMetaComponentSheet { name in
+                try document.addNewMetaComponent(with: name)
+                viewModel.showingNewComponentPopup = nil
+            } onDismiss: {
+                viewModel.showingNewComponentPopup = nil
+            }
         }
+        
     }
     
     private func createSections(families: Set<ComponentsFamily>, component: Component) -> [ComponentDependenciesListSection] {
@@ -403,7 +459,28 @@ struct ContentView: View {
         }
         return sections
     }
-    
+
+    private func createSections(families: Set<ComponentsFamily>, meta: MetaComponent) -> [ComponentDependenciesListSection] {
+        let allNames = families.flatMap(\.components).map(\.name)
+        let filteredNames = Dictionary(grouping: allNames.filter { name in
+            meta.name != name.given && !meta.localDependencies.contains { localDependency in
+                localDependency.name == name
+            }
+        }, by: { $0.family })
+        let sections = filteredNames.reduce(into: [ComponentDependenciesListSection]()) { partialResult, keyValue in
+            partialResult.append(ComponentDependenciesListSection(name: keyValue.key,
+                                                                  rows: keyValue.value.map { name in
+                ComponentDependenciesListRow(name: document.title(forComponentNamed: name)) {
+                    document.addDependencyToMeta(withName: meta.name, dependencyName: name)
+                    viewModel.showingDependencySheet = false
+                }
+            }))
+        }.sorted { lhs, rhs in
+            lhs.name < rhs.name
+        }
+        return sections
+    }
+
     @ViewBuilder private func dependencySheet(component: Component) -> some View {
         let familyName = document.family(named: component.name.family)?.name ?? ""
         let allFamilies: Set<ComponentsFamily> = .init(document.families)
@@ -422,7 +499,24 @@ struct ContentView: View {
                 viewModel.showingDependencySheet = false
             }).frame(minHeight: 600)
     }
-    
+
+    @ViewBuilder private func dependencySheet(meta: MetaComponent) -> some View {
+        let allFamilies: Set<ComponentsFamily> = .init(document.families)
+        let allAllowedFamilies = allFamilies//.filter { !$0.family.excludedFamilies.contains(familyName) }
+        let sections = createSections(families: allAllowedFamilies, meta: meta)
+        let disabledSections = createSections(families: allFamilies.subtracting(allAllowedFamilies), meta: meta)
+        ComponentDependenciesSheet(
+            familyName: "",
+            sections: sections,
+            disabledSections: disabledSections,
+            onOpenFamilySettings: {
+                viewModel.showingDependencySheet = false
+            },
+            onDismiss: {
+                viewModel.showingDependencySheet = false
+            }).frame(minHeight: 600)
+    }
+
     @ViewBuilder private func remoteDependencySheet(component: Component) -> some View {
         RemoteComponentDependenciesSheet(
             rows: document.remoteComponents.filter { remoteComponent in
@@ -575,7 +669,7 @@ struct ContentView: View {
     
     private func onDownArrow() {
         switch listSelection {
-        case .components:
+        case .components, .meta:
             viewModel.selectNextComponent(names: document.families.flatMap(\.components).map(\.name))
         case .remote:
             viewModel.selectNextRemoteComponent(remoteComponents: document.remoteComponents)
@@ -588,7 +682,7 @@ struct ContentView: View {
     
     private func onUpArrow() {
         switch listSelection {
-        case .components:
+        case .components, .meta:
             viewModel.selectPreviousComponent(names: document.families.flatMap(\.components).map(\.name))
         case .remote:
             viewModel.selectPreviousRemoteComponent(remoteComponents: document.remoteComponents)
